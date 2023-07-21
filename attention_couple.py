@@ -33,7 +33,8 @@ class AttentionCouple:
 
     def attention_couple(self, model, positive, negative, mode):
         if mode == "Latent":
-            return (model, positive, negative)
+            return (model, positive, negative) # latent coupleの場合は何もしない
+        
         self.negative_positive_masks = []
         self.negative_positive_conds = []
         
@@ -49,10 +50,10 @@ class AttentionCouple:
             conditions_conds = []
             if len(conditions) != 1:
                 mask_norm = torch.stack([cond[1]["mask"].to(device, dtype=dtype) * cond[1]["mask_strength"] for cond in conditions])
-                mask_norm = mask_norm / mask_norm.sum(dim=0) # 合計が1になるように正規化
+                mask_norm = mask_norm / mask_norm.sum(dim=0) # 合計が1になるように正規化(他が0の場合mask_strengthの効果がなくなる)
                 conditions_masks.extend([mask_norm[i] for i in range(mask_norm.shape[0])])
                 conditions_conds.extend([cond[0].to(device, dtype=dtype) for cond in conditions])
-                del conditions[0][1]["mask"] # latent coupleの無効化
+                del conditions[0][1]["mask"] # latent coupleの無効化のため
                 del conditions[0][1]["mask_strength"]
             else:
                 conditions_masks = [False]
@@ -73,21 +74,30 @@ class AttentionCouple:
     
     def hook_forward(self, module):
         def forward(x, context=None, value=None, mask=None):
+            '''
+            uncond = [uncond1 * batch_size, uncond2 * batch_size, ...]
+            cond = [cond1 * batch_size, cond2 * batch_size, ...]
+            concat = [uncond, cond] (全てのサンプラーがこの順番なことを祈る)
+            '''
+
             q = module.to_q(x)
             
-            len_neg, len_pos = self.conditioning_length
-            q_uncond, q_cond = q.chunk(2)
-            b = q_cond.shape[0]
+            len_neg, len_pos = self.conditioning_length # negative, positiveの長さ
+            q_uncond, q_cond = q.chunk(2) # uncond, condの分割
+            b = q_cond.shape[0] # batch_size
             
+            # maskの作成
             masks_uncond = get_masks_from_q(self.negative_positive_masks[0], q_uncond)
             masks_cond = get_masks_from_q(self.negative_positive_masks[1], q_cond)
             masks = torch.cat(masks_uncond + masks_cond)
 
+            # qをconditionの数だけ拡張
             q_target= torch.cat([q_uncond]*len_neg + [q_cond]*len_pos, dim=0)
             q_target = q_target.view(b*(len_neg+len_pos), -1, module.heads, module.dim_head).transpose(1, 2)
+            
+            # contextをbatch_sizeだけ拡張
             context_uncond = torch.cat([cond.repeat(b,1,1) for cond in self.negative_positive_conds[0]], dim=0)
             context_cond = torch.cat([cond.repeat(b,1,1) for cond in self.negative_positive_conds[1]], dim=0)
-
             context = torch.cat([context_uncond, context_cond], dim=0)
 
             k = module.to_k(context)
@@ -102,7 +112,7 @@ class AttentionCouple:
             
             out_uncond = qkv[:len_neg*b].view(len_neg, b, -1, module.heads * module.dim_head).sum(dim=0)
             out_cond = qkv[len_neg*b:].view(len_pos, b, -1, module.heads * module.dim_head).sum(dim=0)
-            out = torch.cat([out_uncond, out_cond], dim=0) # uncond, cond 全てのサンプラーがこの順番なことを祈る
+            out = torch.cat([out_uncond, out_cond], dim=0)
             return module.to_out(out)
         return forward
         
