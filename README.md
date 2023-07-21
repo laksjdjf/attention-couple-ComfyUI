@@ -1,5 +1,5 @@
 # attention-couple-ComfyUI
-プロンプトの領域指定を行うカスタムノードです。ComfyUIにはlatent coupleベースの領域指定法(ConditioningMask)が存在しますが、こちらはUNet内のAttention層で領域分けします。
+プロンプトの領域指定を行うカスタムノードです。ComfyUIにはlatent coupleベースの領域指定法が存在しますが、こちらはUNet内のAttention層で領域分けします。
 
 # 使い方
 1. custom_nodesにくろーん
