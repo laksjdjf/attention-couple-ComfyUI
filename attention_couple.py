@@ -15,6 +15,14 @@ def get_masks_from_q(masks, q):
             ret_masks.append(torch.ones_like(q))
     return ret_masks
 
+def set_model_patch_replace(model, patch, key):
+    to = model.model_options["transformer_options"]
+    if "patches_replace" not in to:
+        to["patches_replace"] = {}
+    if "attn2" not in to["patches_replace"]:
+        to["patches_replace"]["attn2"] = {}
+    to["patches_replace"]["attn2"][key] = patch
+
 class AttentionCouple:
 
     @classmethod
@@ -61,26 +69,36 @@ class AttentionCouple:
             self.negative_positive_masks.append(conditions_masks)
             self.negative_positive_conds.append(conditions_conds)
         self.conditioning_length = (len(new_negative), len(new_positive))
-            
-        new_model = copy.deepcopy(model)
-        self.hook_forwards(new_model.model.diffusion_model)
+
+        new_model = model.clone()
+        self.sdxl = hasattr(new_model.model.diffusion_model, "label_emb")
+        if not self.sdxl:
+            for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
+                set_model_patch_replace(new_model, self.make_patch(new_model.model.diffusion_model.input_blocks[id][1].transformer_blocks[0].attn2), ("input", id))
+            set_model_patch_replace(new_model, self.make_patch(new_model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2), ("middle", id))
+            for id in [3,4,5,6,7,8,9,10,11]: # id of output_blocks that have cross attention
+                set_model_patch_replace(new_model, self.make_patch(new_model.model.diffusion_model.output_blocks[id][1].transformer_blocks[0].attn2), ("output", id))
+        else:
+            for id in [4,5,7,8]: # id of input_blocks that have cross attention
+                block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
+                for index in block_indices:
+                    set_model_patch_replace(new_model, self.make_patch(new_model.model.diffusion_model.input_blocks[id][1].transformer_blocks[index].attn2), ("input", id, index))
+            for index in range(10):
+                set_model_patch_replace(new_model, self.make_patch(new_model.model.diffusion_model.middle_block[1].transformer_blocks[index].attn2), ("middle", id, index))
+            for id in range(6): # id of output_blocks that have cross attention
+                block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
+                for index in block_indices:
+                    set_model_patch_replace(new_model, self.make_patch(new_model.model.diffusion_model.output_blocks[id][1].transformer_blocks[index].attn2), ("output", id, index))
         
         return (new_model, [new_positive[0]], [new_negative[0]]) # pool outputは・・・後回し
     
-    def hook_forwards(self, root_module: torch.nn.Module):
-        for name, module in root_module.named_modules():
-            if "attn2" in name and "CrossAttention" in module.__class__.__name__:
-                module.forward = self.hook_forward(module)
-    
-    def hook_forward(self, module):
-        def forward(x, context=None, value=None, mask=None):
+    def make_patch(self, module):
+        def patch(q, k, v, extra_options):
             '''
             uncond = [uncond1 * batch_size, uncond2 * batch_size, ...]
             cond = [cond1 * batch_size, cond2 * batch_size, ...]
             concat = [uncond, cond] (全てのサンプラーがこの順番なことを祈る)
             '''
-
-            q = module.to_q(x)
             
             len_neg, len_pos = self.conditioning_length # negative, positiveの長さ
             q_uncond, q_cond = q.chunk(2) # uncond, condの分割
@@ -113,8 +131,8 @@ class AttentionCouple:
             out_uncond = qkv[:len_neg*b].view(len_neg, b, -1, module.heads * module.dim_head).sum(dim=0)
             out_cond = qkv[len_neg*b:].view(len_pos, b, -1, module.heads * module.dim_head).sum(dim=0)
             out = torch.cat([out_uncond, out_cond], dim=0)
-            return module.to_out(out)
-        return forward
+            return out
+        return patch
         
 NODE_CLASS_MAPPINGS = {
     "Attention couple": AttentionCouple
