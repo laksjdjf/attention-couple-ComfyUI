@@ -1,18 +1,31 @@
 import torch
 import torch.nn.functional as F
 import copy
+import comfy
+from comfy.ldm.modules.attention import optimized_attention
 
-def get_masks_from_q(masks, q):
+def get_masks_from_q(masks, q, original_shape):
+
+    if original_shape[2] * original_shape[3] == q.shape[1]:
+        down_sample_rate = 1
+    elif (original_shape[2] // 2) * (original_shape[3] // 2) == q.shape[1]:
+        down_sample_rate = 2
+    elif (original_shape[2] // 4) * (original_shape[3] // 4) == q.shape[1]:
+        down_sample_rate = 4
+    else:
+        down_sample_rate = 8
+
     ret_masks = []
     for mask in masks:
         if isinstance(mask,torch.Tensor):
-            mask_size = mask.shape[1] * mask.shape[2]
-            down_sample_rate = int((mask_size // 64 // q.shape[1]) ** (1/2))
-            mask_downsample = F.interpolate(mask.unsqueeze(0), scale_factor= 1/8/down_sample_rate, mode="nearest").squeeze(0)
+            size = (original_shape[2] // down_sample_rate, original_shape[3] // down_sample_rate)
+            mask_downsample = F.interpolate(mask.unsqueeze(0), size=size, mode="nearest")
             mask_downsample = mask_downsample.view(1,-1, 1).repeat(q.shape[0], 1, q.shape[2])
             ret_masks.append(mask_downsample)
         else: # coupling処理なしの場合
             ret_masks.append(torch.ones_like(q))
+    
+    ret_masks = torch.cat(ret_masks, dim=0)
     return ret_masks
 
 def set_model_patch_replace(model, patch, key):
@@ -50,7 +63,7 @@ class AttentionCouple:
         new_negative = copy.deepcopy(negative)
         
         dtype = model.model.diffusion_model.dtype
-        device = "cuda"
+        device = comfy.model_management.get_torch_device()
         
         # maskとcondをリストに格納する
         for conditions in [new_negative, new_positive]:
@@ -94,43 +107,47 @@ class AttentionCouple:
     
     def make_patch(self, module):
         def patch(q, k, v, extra_options):
-            '''
-            uncond = [uncond1 * batch_size, uncond2 * batch_size, ...]
-            cond = [cond1 * batch_size, cond2 * batch_size, ...]
-            concat = [uncond, cond] (全てのサンプラーがこの順番なことを祈る)
-            '''
             
             len_neg, len_pos = self.conditioning_length # negative, positiveの長さ
-            q_uncond, q_cond = q.chunk(2) # uncond, condの分割
-            b = q_cond.shape[0] # batch_size
+            cond_or_uncond = extra_options["cond_or_uncond"] # 0: cond, 1: uncond
+            q_list = q.chunk(len(cond_or_uncond), dim=0)
+            b = q_list[0].shape[0] # batch_size
             
-            # maskの作成
-            masks_uncond = get_masks_from_q(self.negative_positive_masks[0], q_uncond)
-            masks_cond = get_masks_from_q(self.negative_positive_masks[1], q_cond)
-            masks = torch.cat(masks_uncond + masks_cond)
+            masks_uncond = get_masks_from_q(self.negative_positive_masks[0], q_list[0], extra_options["original_shape"])
+            masks_cond = get_masks_from_q(self.negative_positive_masks[1], q_list[0], extra_options["original_shape"])
 
-            # qをconditionの数だけ拡張
-            q_target= torch.cat([q_uncond]*len_neg + [q_cond]*len_pos, dim=0)
-            q_target = q_target.view(b*(len_neg+len_pos), -1, module.heads, module.dim_head).transpose(1, 2)
+            context_uncond = torch.cat([cond for cond in self.negative_positive_conds[0]], dim=0)
+            context_cond = torch.cat([cond for cond in self.negative_positive_conds[1]], dim=0)
             
-            # contextをbatch_sizeだけ拡張
-            context_uncond = torch.cat([cond.repeat(b,1,1) for cond in self.negative_positive_conds[0]], dim=0)
-            context_cond = torch.cat([cond.repeat(b,1,1) for cond in self.negative_positive_conds[1]], dim=0)
-            context = torch.cat([context_uncond, context_cond], dim=0)
+            k_uncond = module.to_k(context_uncond)
+            k_cond = module.to_k(context_cond)
+            v_uncond = module.to_v(context_uncond)
+            v_cond = module.to_v(context_cond)
 
-            k = module.to_k(context)
-            v = module.to_v(context)
-            
-            k = k.view(b * (len_neg + len_pos), -1, module.heads, module.dim_head).transpose(1, 2)
-            v = v.view(b * (len_neg + len_pos), -1, module.heads, module.dim_head).transpose(1, 2)
+            out = []
+            for i, c in enumerate(cond_or_uncond):
+                if c == 0:
+                    masks = masks_cond
+                    k = k_cond
+                    v = v_cond
+                    length = len_pos
+                else:
+                    masks = masks_uncond
+                    k = k_uncond
+                    v = v_uncond
+                    length = len_neg
 
-            qkv = torch.nn.functional.scaled_dot_product_attention(q_target, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
-            qkv = qkv.transpose(1, 2).reshape(b * (len_neg + len_pos), -1, module.heads * module.dim_head)
-            qkv = qkv * masks
-            
-            out_uncond = qkv[:len_neg*b].view(len_neg, b, -1, module.heads * module.dim_head).sum(dim=0)
-            out_cond = qkv[len_neg*b:].view(len_pos, b, -1, module.heads * module.dim_head).sum(dim=0)
-            out = torch.cat([out_uncond, out_cond], dim=0)
+                q_target = q_list[i].repeat(length, 1, 1)
+                k = torch.cat([k[i].unsqueeze(0).repeat(b,1,1) for i in range(length)], dim=0)
+                v = torch.cat([v[i].unsqueeze(0).repeat(b,1,1) for i in range(length)], dim=0)
+
+                qkv = optimized_attention(q_target, k, v, extra_options["n_heads"])
+                qkv = qkv * masks
+                qkv = qkv.view(length, b, -1, module.heads * module.dim_head).sum(dim=0)
+
+                out.append(qkv)
+
+            out = torch.cat(out, dim=0)
             return out
         return patch
         
