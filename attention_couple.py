@@ -88,7 +88,7 @@ class AttentionCouple:
         if not self.sdxl:
             for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
                 set_model_patch_replace(new_model, self.make_patch(new_model.model.diffusion_model.input_blocks[id][1].transformer_blocks[0].attn2), ("input", id))
-            set_model_patch_replace(new_model, self.make_patch(new_model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2), ("middle", id))
+            set_model_patch_replace(new_model, self.make_patch(new_model.model.diffusion_model.middle_block[1].transformer_blocks[0].attn2), ("middle", 0))
             for id in [3,4,5,6,7,8,9,10,11]: # id of output_blocks that have cross attention
                 set_model_patch_replace(new_model, self.make_patch(new_model.model.diffusion_model.output_blocks[id][1].transformer_blocks[0].attn2), ("output", id))
         else:
