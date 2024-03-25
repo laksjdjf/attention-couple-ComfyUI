@@ -1,4 +1,7 @@
 # attention-couple-ComfyUI
+このプロジェクトはこちらへ移動しました。
+->https://github.com/laksjdjf/cgem156-ComfyUI/tree/main/scripts/attention_couple
+
 プロンプトの領域指定を行うカスタムノードです。ComfyUIにはlatent coupleベースの領域指定法が存在しますが、こちらはUNet内のAttention層で領域分けします。
 
 # 使い方
