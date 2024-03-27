@@ -116,8 +116,11 @@ class AttentionCouple:
             masks_uncond = get_masks_from_q(self.negative_positive_masks[0], q_list[0], extra_options["original_shape"])
             masks_cond = get_masks_from_q(self.negative_positive_masks[1], q_list[0], extra_options["original_shape"])
 
-            context_uncond = torch.cat([cond for cond in self.negative_positive_conds[0]], dim=0)
-            context_cond = torch.cat([cond for cond in self.negative_positive_conds[1]], dim=0)
+            maxi_prompt_size_uncond = max([cond.shape[1] for cond in self.negative_positive_conds[0]])
+            context_uncond = torch.cat([cond.repeat(1, maxi_prompt_size_uncond//cond.shape[1], 1) for cond in self.negative_positive_conds[0]], dim=0)
+
+            maxi_prompt_size_cond = max([cond.shape[1] for cond in self.negative_positive_conds[1]])
+            context_cond = torch.cat([cond.repeat(1, maxi_prompt_size_cond//cond.shape[1], 1) for cond in self.negative_positive_conds[1]], dim=0)
             
             k_uncond = module.to_k(context_uncond)
             k_cond = module.to_k(context_cond)
